@@ -373,8 +373,8 @@ class MLXModelManager: ObservableObject {
 
                 if let contentLengthStr = httpResponse.value(forHTTPHeaderField: "Content-Length"),
                    let contentLength = Int64(contentLengthStr) {
-                    guard written == contentLength else {
-                        print("⚠️ Content length mismatch: expected \(contentLength), got \(written)")
+                    guard existingSize + written == contentLength else {
+                        print("⚠️ Content length mismatch: expected \(contentLength), got \(existingSize + written)")
                         throw ModelError.downloadIncomplete
                     }
                 }

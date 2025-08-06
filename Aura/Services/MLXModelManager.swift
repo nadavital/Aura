@@ -157,9 +157,10 @@ class MLXModelManager: ObservableObject {
             }
             
             print("📊 Found \(status.missingFiles.count) missing files, current size: \(String(format: "%.1f", status.totalSizeGB))GB")
-            
+
             // Download missing files only (resume functionality)
-            try await downloadMLXModel(missingFiles: status.missingFiles)
+            let startingBytes = Int64(status.totalSizeGB * 1024 * 1024 * 1024)
+            try await downloadMLXModel(missingFiles: status.missingFiles, startingBytes: startingBytes)
             
             // Verify download
             checkModelExists()
@@ -178,7 +179,7 @@ class MLXModelManager: ObservableObject {
         isDownloading = false
     }
     
-    private func downloadMLXModel(missingFiles: [String] = []) async throws {
+    private func downloadMLXModel(missingFiles: [String] = [], startingBytes: Int64 = 0) async throws {
         // Essential config files
         let configFiles = [
             "config.json",
@@ -219,32 +220,60 @@ class MLXModelManager: ObservableObject {
             }
         }
         
-        let totalFiles = filesToDownload.count
-        var filesCompleted = 0
-        
-        print("📦 Downloading \(totalFiles) files...")
-        
+        var totalBytesDownloaded = startingBytes
+        var totalExpectedBytes = startingBytes
+
+        // Attempt to get exact sizes of files to download
+        for filename in filesToDownload {
+            guard let url = URL(string: "\(baseURL)/\(filename)?download=1") else { continue }
+            var headRequest = URLRequest(url: url)
+            headRequest.httpMethod = "HEAD"
+            do {
+                let (_, response) = try await URLSession.shared.data(for: headRequest)
+                if let httpResponse = response as? HTTPURLResponse,
+                   let lengthStr = httpResponse.value(forHTTPHeaderField: "Content-Length"),
+                   let length = Int64(lengthStr) {
+                    totalExpectedBytes += length
+                }
+            } catch {
+                totalExpectedBytes = Int64(self.estimatedSizeGB * 1024 * 1024 * 1024)
+                break
+            }
+        }
+
+        if totalExpectedBytes == startingBytes {
+            totalExpectedBytes = Int64(self.estimatedSizeGB * 1024 * 1024 * 1024)
+        }
+
+        print("📦 Downloading \(filesToDownload.count) files...")
+
         for filename in filesToDownload {
             let isShard = filename.contains("safetensors") && filename.contains("model-")
             print("📥 Downloading \(filename)\(isShard ? " (large file - may take a while)" : "")...")
-            
-            let fileURL = "\(baseURL)/\(filename)"
+
+            let fileURL = "\(baseURL)/\(filename)?download=1"
             let localURL = modelPath.appendingPathComponent(filename)
-            
-            try await downloadFile(from: fileURL, to: localURL)
-            
-            filesCompleted += 1
-            await MainActor.run {
-                self.downloadProgress = Double(filesCompleted) / Double(totalFiles)
-                self.downloadedGB = self.downloadProgress * self.estimatedSizeGB
+
+            try await downloadFile(from: fileURL, to: localURL) { bytes in
+                totalBytesDownloaded += bytes
+                let progress = Double(totalBytesDownloaded) / Double(totalExpectedBytes)
+                await MainActor.run {
+                    self.downloadProgress = progress
+                    self.downloadedGB = Double(totalBytesDownloaded) / Double(1024 * 1024 * 1024)
+                }
             }
-            
+
             print("✅ Downloaded \(filename)")
+        }
+
+        await MainActor.run {
+            self.downloadProgress = 1.0
+            self.downloadedGB = Double(totalExpectedBytes) / Double(1024 * 1024 * 1024)
         }
     }
     
     
-    private func downloadFile(from urlString: String, to localURL: URL) async throws {
+    private func downloadFile(from urlString: String, to localURL: URL, progress: @escaping (Int64) -> Void) async throws {
         guard let url = URL(string: urlString) else {
             throw ModelError.invalidURL
         }
@@ -290,18 +319,15 @@ class MLXModelManager: ObservableObject {
         var lastError: Error?
         for attempt in 1...5 { // Increased retry attempts
             do {
-                let (downloadedURL, response) = try await session.download(for: request)
-                
+                let (bytes, response) = try await session.bytes(for: request)
+
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw ModelError.downloadFailed
                 }
-                
-                // Validate response status
+
                 if existingSize > 0 {
-                    // Resume case: expect 206 (partial content)
                     guard httpResponse.statusCode == 206 else {
                         if httpResponse.statusCode == 200 {
-                            // Server doesn't support resume, start over
                             try? FileManager.default.removeItem(at: tempURL)
                             existingSize = 0
                             request.setValue(nil, forHTTPHeaderField: "Range")
@@ -310,77 +336,76 @@ class MLXModelManager: ObservableObject {
                         throw ModelError.httpError(httpResponse.statusCode)
                     }
                 } else {
-                    // Fresh download: expect 200
                     guard httpResponse.statusCode == 200 else {
                         throw ModelError.httpError(httpResponse.statusCode)
                     }
                 }
-                
-                // Validate content length if provided
+
+                if !FileManager.default.fileExists(atPath: tempURL.path) {
+                    FileManager.default.createFile(atPath: tempURL.path, contents: nil)
+                }
+                let fileHandle = try FileHandle(forWritingTo: tempURL)
+                if existingSize > 0 { fileHandle.seekToEndOfFile() }
+
+                var written: Int64 = 0
+                var buffer = Data()
+                buffer.reserveCapacity(1024 * 1024)
+
+                for try await byte in bytes {
+                    buffer.append(byte)
+                    if buffer.count >= 1024 * 1024 {
+                        fileHandle.write(buffer)
+                        written += Int64(buffer.count)
+                        progress(Int64(buffer.count))
+                        buffer.removeAll(keepingCapacity: true)
+                    }
+                }
+                if !buffer.isEmpty {
+                    fileHandle.write(buffer)
+                    written += Int64(buffer.count)
+                    progress(Int64(buffer.count))
+                }
+                try fileHandle.close()
+
                 if let contentLengthStr = httpResponse.value(forHTTPHeaderField: "Content-Length"),
                    let contentLength = Int64(contentLengthStr) {
-                    let downloadedData = try Data(contentsOf: downloadedURL)
-                    guard downloadedData.count == contentLength else {
-                        print("⚠️ Content length mismatch: expected \(contentLength), got \(downloadedData.count)")
+                    guard written == contentLength else {
+                        print("⚠️ Content length mismatch: expected \(contentLength), got \(written)")
                         throw ModelError.downloadIncomplete
                     }
                 }
-                
-                if existingSize > 0 {
-                    // Append to existing partial file
-                    let fileHandle = try FileHandle(forWritingTo: tempURL)
-                    defer { fileHandle.closeFile() }
-                    
-                    fileHandle.seekToEndOfFile()
-                    let newData = try Data(contentsOf: downloadedURL)
-                    fileHandle.write(newData)
-                } else {
-                    // Move downloaded file to temp location
-                    if FileManager.default.fileExists(atPath: tempURL.path) {
-                        try FileManager.default.removeItem(at: tempURL)
-                    }
-                    try FileManager.default.moveItem(at: downloadedURL, to: tempURL)
-                }
-                
-                // Validate downloaded file integrity
+
                 try await validateDownloadedFile(at: tempURL, fileName: localURL.lastPathComponent)
-                
-                // Move to final location atomically
+
                 if FileManager.default.fileExists(atPath: localURL.path) {
                     try FileManager.default.removeItem(at: localURL)
                 }
                 try FileManager.default.moveItem(at: tempURL, to: localURL)
-                
+
                 print("✅ Download completed: \(localURL.lastPathComponent)")
-                return // Success, exit retry loop
-                
+                return
+
             } catch let err {
                 lastError = err
-                
-                // Check if this is an integrity error
+
                 if let modelError = err as? ModelError,
                    modelError == .downloadIncomplete || modelError == .fileCorrupted {
                     print("⚠️ Download attempt \(attempt) failed with integrity error: \(err)")
-                    
-                    // Remove corrupted partial file
                     try? FileManager.default.removeItem(at: tempURL)
                     existingSize = 0
                     request.setValue(nil, forHTTPHeaderField: "Range")
                 } else {
                     print("⚠️ Download attempt \(attempt) failed: \(err)")
                 }
-                
+
                 if attempt < 5 {
                     let backoffSeconds = min(pow(2.0, Double(attempt)), 30.0)
                     try await Task.sleep(nanoseconds: UInt64(backoffSeconds * 1_000_000_000))
                 }
             }
         }
-        
-        // Clean up partial file on complete failure
+
         try? FileManager.default.removeItem(at: tempURL)
-        
-        // If we get here, all retries failed
         throw lastError ?? ModelError.downloadFailed
     }
     
@@ -764,7 +789,7 @@ class MLXModelManager: ObservableObject {
         }
         
         // Re-download the specific shard
-        try await downloadFile(from: fileURL, to: localURL)
+        try await downloadFile(from: fileURL, to: localURL) { _ in }
         print("✅ Re-downloaded \(shardName)")
     }
     

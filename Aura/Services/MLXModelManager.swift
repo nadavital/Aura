@@ -234,10 +234,11 @@ class MLXModelManager: ObservableObject {
                    let lengthStr = httpResponse.value(forHTTPHeaderField: "Content-Length"),
                    let length = Int64(lengthStr) {
                     totalExpectedBytes += length
+                } else {
+                    totalExpectedBytes += estimatedBytesPerFile
                 }
             } catch {
-                totalExpectedBytes = Int64(self.estimatedSizeGB * 1024 * 1024 * 1024)
-                break
+                totalExpectedBytes += estimatedBytesPerFile
             }
         }
 

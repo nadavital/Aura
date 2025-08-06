@@ -349,7 +349,9 @@ class MLXModelManager: ObservableObject {
                 defer {
                     try? fileHandle.close()
                 }
-                if existingSize > 0 { fileHandle.seekToEndOfFile() }
+                if existingSize > 0 {
+                    fileHandle.seekToEndOfFile()
+                }
 
                 var written: Int64 = 0
                 var buffer = Data()

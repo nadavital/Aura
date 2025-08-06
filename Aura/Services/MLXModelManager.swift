@@ -353,11 +353,11 @@ class MLXModelManager: ObservableObject {
 
                 var written: Int64 = 0
                 var buffer = Data()
-                buffer.reserveCapacity(1024 * 1024)
+                buffer.reserveCapacity(Self.bufferSize)
 
                 for try await byte in bytes {
                     buffer.append(byte)
-                    if buffer.count >= 1024 * 1024 {
+                    if buffer.count >= Self.bufferSize {
                         fileHandle.write(buffer)
                         written += Int64(buffer.count)
                         progress(Int64(buffer.count))

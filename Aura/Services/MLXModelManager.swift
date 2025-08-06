@@ -346,6 +346,9 @@ class MLXModelManager: ObservableObject {
                     FileManager.default.createFile(atPath: tempURL.path, contents: nil)
                 }
                 let fileHandle = try FileHandle(forWritingTo: tempURL)
+                defer {
+                    try? fileHandle.close()
+                }
                 if existingSize > 0 { fileHandle.seekToEndOfFile() }
 
                 var written: Int64 = 0

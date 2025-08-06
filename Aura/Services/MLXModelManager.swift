@@ -371,7 +371,6 @@ class MLXModelManager: ObservableObject {
                     written += Int64(buffer.count)
                     progress(Int64(buffer.count))
                 }
-                try fileHandle.close()
 
                 if let contentLengthStr = httpResponse.value(forHTTPHeaderField: "Content-Length"),
                    let contentLength = Int64(contentLengthStr) {

@@ -228,7 +228,8 @@ class MLXModelManager: ObservableObject {
             let isShard = filename.contains("safetensors") && filename.contains("model-")
             print("📥 Downloading \(filename)\(isShard ? " (large file - may take a while)" : "")...")
             
-            let fileURL = "\(baseURL)/\(filename)"
+            // Ensure we request the raw file from HuggingFace's CDN
+            let fileURL = "\(baseURL)/\(filename)?download=1"
             let localURL = modelPath.appendingPathComponent(filename)
             
             try await downloadFile(from: fileURL, to: localURL)
@@ -319,21 +320,30 @@ class MLXModelManager: ObservableObject {
                 // Validate content length if provided
                 if let contentLengthStr = httpResponse.value(forHTTPHeaderField: "Content-Length"),
                    let contentLength = Int64(contentLengthStr) {
-                    let downloadedData = try Data(contentsOf: downloadedURL)
-                    guard downloadedData.count == contentLength else {
-                        print("⚠️ Content length mismatch: expected \(contentLength), got \(downloadedData.count)")
+                    let attributes = try FileManager.default.attributesOfItem(atPath: downloadedURL.path)
+                    let downloadedSize = (attributes[.size] as? Int64) ?? 0
+                    guard downloadedSize == contentLength else {
+                        print("⚠️ Content length mismatch: expected \(contentLength), got \(downloadedSize)")
                         throw ModelError.downloadIncomplete
                     }
                 }
-                
+
                 if existingSize > 0 {
-                    // Append to existing partial file
-                    let fileHandle = try FileHandle(forWritingTo: tempURL)
-                    defer { fileHandle.closeFile() }
-                    
-                    fileHandle.seekToEndOfFile()
-                    let newData = try Data(contentsOf: downloadedURL)
-                    fileHandle.write(newData)
+                    // Append to existing partial file without loading into memory
+                    let writeHandle = try FileHandle(forWritingTo: tempURL)
+                    defer { writeHandle.closeFile() }
+                    let readHandle = try FileHandle(forReadingFrom: downloadedURL)
+                    defer {
+                        readHandle.closeFile()
+                        try? FileManager.default.removeItem(at: downloadedURL)
+                    }
+
+                    writeHandle.seekToEndOfFile()
+                    while true {
+                        let chunk = readHandle.readData(ofLength: 1024 * 1024) // 1MB chunks
+                        if chunk.isEmpty { break }
+                        writeHandle.write(chunk)
+                    }
                 } else {
                     // Move downloaded file to temp location
                     if FileManager.default.fileExists(atPath: tempURL.path) {
